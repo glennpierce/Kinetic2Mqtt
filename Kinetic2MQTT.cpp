@@ -13,9 +13,12 @@
 #include <IotWebConfUsing.h>
 #include <PubSubClient.h>
 #include <AceCRC.h>
-
+#include <string>
+#include "SwitchUnit.h"
 #include "Kinetic2MQTT.h"
 
+// CRC-16/SPI-FUJITSU
+// CRC-16/AUG-CCITT
 // Select the type of CRC algorithm we'll be using
 using namespace ace_crc::crc16ccitt_byte;
 
@@ -76,19 +79,8 @@ IotWebConfTextParameter mqttTopicParam = IotWebConfTextParameter("MQTT Topic", "
 
 bool needReset = false;
 
-// Global State Variables
-char lastSentSwitchID[5] = "";
-char lastSentButtonAction[8] = "";
-unsigned long lastSentMillis = 0;
-
-// Variables for Hold Detection
-static unsigned long holdStartMillis = 0;
-static bool isHolding = false;
-static unsigned long lastHoldMillis = 0;
-static bool holdActionSent = false;       // Flag to track if hold action was sent
-const unsigned int maxHoldMessages = 4;   // Maximum number of hold messages
-static unsigned int holdMessageCount = 0; // Counter for hold messages
-
+//std::unordered_map<String, SwitchUnit> switches;
+std::unordered_map<std::string, SwitchUnit> switches;
 
 // Convert array of bytes into a string containing the HEX representation of the array
 static void bytesToHexString(byte array[], unsigned int len, char buffer[])
@@ -104,10 +96,10 @@ static void bytesToHexString(byte array[], unsigned int len, char buffer[])
 }
 
 // Publish [value] to MQTT at topic: [mqttTopicValue]/[topicLevel1]/[topicLevel2]
-static void publishMqtt(const char *topicLevel1, const char *topicLevel2, const char *value)
+static void publishMqtt(PubSubClient& mqttClient, const char *topicLevel0, const char *topicLevel1, const char *topicLevel2, const char *value)
 {
-  char compiledTopic[strlen(mqttTopicValue) + strlen(topicLevel1) + strlen(topicLevel2) + 3] = "";
-  strcat(compiledTopic, mqttTopicValue);
+  char compiledTopic[strlen(topicLevel0) + strlen(topicLevel1) + strlen(topicLevel2) + 3] = "";
+  strcat(compiledTopic, topicLevel0);
   strcat(compiledTopic, "/");
   strcat(compiledTopic, topicLevel1);
   strcat(compiledTopic, "/");
@@ -200,6 +192,11 @@ volatile bool receivedFlag = false;
 ICACHE_RAM_ATTR
 #endif
 
+void myMqttPublish(const char* topic1, const char* topic2, const char* value) {  
+
+  publishMqtt(mqttClient, mqttTopicValue, topic1, topic2, value);
+}
+
 void setFlag(void)
 {
   // we got a packet, set the flag
@@ -235,70 +232,28 @@ void loop()
     {
       if (radio.getRSSI() > MIN_RSSI)
       {
+       
         byte messageArr[] = {byteArr[0], byteArr[1], byteArr[2]};
         unsigned long messageCRC = (byteArr[3] << 8) | byteArr[4];
         crc_t crc = crc_init();
         crc = crc_update(crc, messageArr, 3);
         crc = crc_finalize(crc);
 
-        if (((unsigned long)crc) == messageCRC)
-        {
-          char switchID[5] = "";
+        if (crc == messageCRC) {
+          char switchID[5];
           bytesToHexString(byteArr, 2, switchID);
-
-          char buttonAction[] = "release";
-          if ((byteArr[2] >> 7) == 0)
-          {
-            strcpy(buttonAction, "press");
+          //String idStr(switchID);
+          std::string idStr(switchID);
+    
+          if (switches.find(idStr) == switches.end()) {
+            switches[idStr] = SwitchUnit();
+            switches[idStr].setPublisher(myMqttPublish);
           }
+    
+          switches[idStr].handlePacket(byteArr, radio.getRSSI());
 
-          unsigned long currentMillis = millis();
-
-          if (!((strcmp(switchID, lastSentSwitchID) == 0) && (strcmp(buttonAction, lastSentButtonAction) == 0) && ((currentMillis - lastSentMillis) < DEBOUNCE_MILLIS)))
-          {
-            // Serial.print("Button action: ");
-            // Serial.print(switchID);
-            // Serial.print(", action: ");
-            // Serial.println(buttonAction);
-
-            // Publish RSSI
-            char topicLevel1[] = "status";
-            char topicLevel2[] = "rssi";
-            char messageValue[20] = "";
-            sprintf(messageValue, "%f dBm", radio.getRSSI());
-            publishMqtt(topicLevel1, topicLevel2, messageValue);
-
-            // Handle press action
-            if (strcmp(buttonAction, "press") == 0)
-            {
-              holdStartMillis = currentMillis; // Start hold timer
-              isHolding = true;
-              lastHoldMillis = currentMillis;
-              holdActionSent = false; // Reset hold action flag
-              holdMessageCount = 0;   // Reset hold message counter
-              publishMqtt("action", switchID, "press");
-            }
-            // Handle release action
-            else if (strcmp(buttonAction, "release") == 0)
-            {
-              //Serial.print("holdActionSent: ");
-              //Serial.println(holdActionSent);
-
-              if (holdActionSent == false)
-              {
-                publishMqtt("action", switchID, "release");
-              }
-              isHolding = false; // Stop hold tracking
-            }
-
-            strcpy(lastSentButtonAction, buttonAction);
-            strcpy(lastSentSwitchID, switchID);
-            lastSentMillis = currentMillis;
-          }
-        }
-        else
-        {
-          Serial.println("Error: CRC Mismatch!");
+        } else {
+          Serial.println("CRC mismatch.");
         }
       }
     }
@@ -312,17 +267,8 @@ void loop()
     radio.startReceive();
   }
 
-  // Emit "hold" every second if button is held, up to maxHoldMessages times
-  if (isHolding && (millis() - holdStartMillis > HOLD_THRESHOLD_TIME) && holdMessageCount < maxHoldMessages)
-  {
-    if (millis() - lastHoldMillis >= 1000)
-    {
-      Serial.println("Button hold detected, sending MQTT hold signal.");
-      publishMqtt("action", lastSentSwitchID, "hold");
-      lastHoldMillis = millis();
-      holdActionSent = true; // Set hold action flag
-      holdMessageCount++;    // Increment hold message counter
-    }
+  for (auto& pair : switches) {
+    pair.second.checkHold();
   }
 
   // Handle OTA updates
@@ -349,7 +295,7 @@ void connectMqtt()
     char topicLevel1[] = "status";
     char topicLevel2[] = "connection";
     char messageValue[] = "connected";
-    publishMqtt(topicLevel1, topicLevel2, messageValue);
+    publishMqtt(mqttClient, mqttTopicValue, topicLevel1, topicLevel2, messageValue);
   }
   else
   {
