@@ -44,8 +44,8 @@ private:
   bool holdActionSent;
   int holdMessageCount;
 
-  static const unsigned long DEBOUNCE_MILLIS = 500;
-  static const unsigned long HOLD_THRESHOLD_TIME = 3000;
+  static const unsigned long DEBOUNCE_MILLIS = 200;
+  static const unsigned long HOLD_THRESHOLD_TIME = 4000;
   static const int maxHoldMessages = 8;
 };
 

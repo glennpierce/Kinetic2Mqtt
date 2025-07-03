@@ -1,14 +1,17 @@
-// publishes
-// kinetic_switches/status/rssi: -20.000000 dBm
-// kinetic_switches/action/1E6B: press
-// kinetic_switches/status/rssi: -19.000000 dBm
-// kinetic_switches/action/1E6B: release
-// kinetic_switches/action/1E6B: hold
-// kinetic_switches/action/1E6B: hold
-
 #include <Arduino.h>
-#include <ArduinoOTA.h>
+
+// Enable RadioLib debug output
+// #define RADIOLIB_DEBUG_BASIC        (1)   // basic debugging (e.g. reporting GPIO timeouts or module not being found)
+// #define RADIOLIB_DEBUG_PROTOCOL     (1)   // protocol information (e.g. LoRaWAN internal information)
+// #define RADIOLIB_DEBUG_SPI          (1)   // verbose transcription of all SPI communication - produces large debug logs!
+
+// #define RADIOLIB_DEBUG
+// #define RADIOLIB_DEBUG_PRINT(...) Serial.print(__VA_ARGS__)
+// #define RADIOLIB_DEBUG_PRINTLN(...) Serial.println(__VA_ARGS__)
+
 #include <RadioLib.h>
+
+#include <ArduinoOTA.h>
 #include <IotWebConf.h>
 #include <IotWebConfUsing.h>
 #include <PubSubClient.h>
@@ -29,8 +32,8 @@ using namespace ace_crc::crc16ccitt_byte;
 #define BIT_RATE 100.0            // kbps
 #define FREQUENCY_DEVIATION 50.0  // kHz
 
-// #define RX_BANDWIDTH 150.0     // kH
-#define RX_BANDWIDTH 400.0        // kH
+#define RX_BANDWIDTH 135.0  
+//#define RX_BANDWIDTH 390.0
 
 #define OUTPUT_POWER 10           // dBm
 #define PREAMBLE_LENGTH 16        // bits
@@ -41,6 +44,10 @@ using namespace ace_crc::crc16ccitt_byte;
 #define CONFIG_PIN 4  // D2
 #define STATUS_PIN 16 // D0
 
+
+const int MQTT_SEND_PIN = 25;  // GPIO 25
+const int ERROR_PIN = 26;  // GPIO 26
+
 // Kinetic2MQTT Config
 #define DEBOUNCE_MILLIS 15
 
@@ -48,7 +55,7 @@ using namespace ace_crc::crc16ccitt_byte;
 
 // CC1101 has the following connections:
 // CS pin:    15
-// GDO0 pin:  5
+// GDO0 pin:  5   Data output
 // RST pin:   unused
 // GDO2 pin:  unused (optional)
 CC1101 radio = new Module(15, 5, RADIOLIB_NC, RADIOLIB_NC);
@@ -111,20 +118,66 @@ static void publishMqtt(PubSubClient& mqttClient, const char *topicLevel0, const
   Serial.println(value);
 
   mqttClient.publish(compiledTopic, value);
+
+  digitalWrite(MQTT_SEND_PIN, HIGH);
+  delay(500);
+  digitalWrite(MQTT_SEND_PIN, LOW);
+}
+
+void cc1101ResetSPI() {
+  pinMode(15, OUTPUT);
+  digitalWrite(15, HIGH);
+  delay(1);
+  digitalWrite(15, LOW);
+  delay(1);
+  digitalWrite(15, HIGH);
+  delay(1);
+}
+
+uint8_t cc1101ReadRegister(uint8_t addr) {
+  // For single-byte register read:
+  // The MSB = 1 means READ, the rest is the register address
+  digitalWrite(15, LOW);
+  SPI.transfer(addr | 0x80);   // READ
+  uint8_t val = SPI.transfer(0x00);
+  digitalWrite(15, HIGH);
+  return val;
 }
 
 void setup()
 {
   Serial.begin(115200);
+
   pinMode(CONFIG_PIN, INPUT_PULLUP);
 
-  // Initialise and configure CC1101
+  pinMode(MQTT_SEND_PIN, OUTPUT);
+  pinMode(ERROR_PIN, OUTPUT);
+  
+  SPI.begin(18, 19, 23, 15);  // SCK, MISO, MOSI, CS
 
-  Serial.print("Initializing Radio... ");
+  cc1101ResetSPI();
+
+  uint8_t version = cc1101ReadRegister(0x31);
+  Serial.print("CC1101 VERSION: 0x");
+  Serial.println(version, HEX);
+
+  Serial.println("Initializing Radio...");
 
   int state = radio.begin(CARRIER_FREQUENCY, BIT_RATE, FREQUENCY_DEVIATION, RX_BANDWIDTH, OUTPUT_POWER, PREAMBLE_LENGTH);
+
+  if (state != RADIOLIB_ERR_NONE) {
+    Serial.print("radio.begin failed with code: ");
+    Serial.println(state);
+    digitalWrite(ERROR_PIN, HIGH);
+    while (true);
+  } else {
+    Serial.println("radio.begin successful");
+  }
+
   radio.setCrcFiltering(false);
   radio.fixedPacketLengthMode(PACKET_LENGTH);
+
+  radio.setPreambleLength(16, 1);  // 16 bits preamble
 
   uint8_t syncWord[] = {0xA4, 0x23};
   radio.setSyncWord(syncWord, 2);
@@ -132,6 +185,7 @@ void setup()
   radio.setGdo0Action(setFlag, RISING);
 
   state = radio.startReceive();
+
   if (state == RADIOLIB_ERR_NONE)
   {
     Serial.println("done!");
@@ -140,8 +194,8 @@ void setup()
   {
     Serial.print("failed, code ");
     Serial.println(state);
-    while (true)
-      ;
+    digitalWrite(ERROR_PIN, HIGH);
+    while (true);
   }
 
   // Initialise IOTWebConf
@@ -200,8 +254,12 @@ void myMqttPublish(const char* topic1, const char* topic2, const char* value) {
 void setFlag(void)
 {
   // we got a packet, set the flag
-  // Serial.println("Received Packet");
+  // Serial.println("=== ISR FLAG SET ===");
   receivedFlag = true;
+  if(radio.getRSSI() > MIN_RSSI) {
+    Serial.println("Received packet with low RSSI, ignoring.");
+  }
+  return; // Ignore packets with low RSSI
 }
 
 void loop()
@@ -225,6 +283,8 @@ void loop()
   // If a message has been received and flag has been set by interrupt, process the message
   if (receivedFlag)
   {
+    // Serial.println("Received Packet");
+
     byte byteArr[PACKET_LENGTH];
     int state = radio.readData(byteArr, PACKET_LENGTH);
 
@@ -232,6 +292,8 @@ void loop()
     {
       if (radio.getRSSI() > MIN_RSSI)
       {
+
+        Serial.println("Received Packet");
        
         byte messageArr[] = {byteArr[0], byteArr[1], byteArr[2]};
         unsigned long messageCRC = (byteArr[3] << 8) | byteArr[4];

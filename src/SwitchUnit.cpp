@@ -1,6 +1,28 @@
 #include <PubSubClient.h>
 #include "SwitchUnit.h"
 
+const char* buttonActionToString(ButtonAction action) {
+  switch (action) {
+    case LEFT_PRESS: return "LEFT_PRESS";
+    case RIGHT_PRESS: return "RIGHT_PRESS";
+    case RELEASE: return "RELEASE";
+    case LEFT_HOLD: return "LEFT_HOLD";
+    case RIGHT_HOLD: return "RIGHT_HOLD";
+    default: return "UNKNOWN";
+  }
+}
+
+void printActions(const std::vector<ButtonAction>& actions) {
+  Serial.print("Actions: [ ");
+  for (size_t i = 0; i < actions.size(); ++i) {
+    Serial.print(buttonActionToString(actions[i]));
+    if (i < actions.size() - 1) {
+      Serial.print(", ");
+    }
+  }
+  Serial.println(" ]");
+}
+
 SwitchUnit::SwitchUnit()
     : publishMqtt(nullptr), lastAction(RELEASE), lastSentMillis(0),
       isHolding(false), holdStartMillis(0), lastHoldMillis(0),
@@ -22,11 +44,11 @@ void SwitchUnit::handlePacket(const byte *byteArr, float rssi)
     byte actionByte = byteArr[2];
     std::vector<ButtonAction> actions;
 
-    // for (int i = 7; i >= 0; i--)
-    // {
-    //     Serial.print(bitRead(actionByte, i));
-    // }
-    // Serial.println();
+    for (int i = 7; i >= 0; i--)
+    {
+        Serial.print(bitRead(actionByte, i));
+    }
+    Serial.println();
 
     if ((actionByte & 0b00000001) != 0)
         actions.push_back(LEFT_PRESS);
@@ -35,19 +57,32 @@ void SwitchUnit::handlePacket(const byte *byteArr, float rssi)
     if (actionByte == 0b11000000)
         actions.push_back(RELEASE);
 
+    printActions(actions);
+
     unsigned long currentMillis = millis();
 
     for (ButtonAction action : actions)
     {
-        if (strcmp(switchID, lastSentSwitchID) == 0 &&
-            action == lastAction &&
-            (currentMillis - lastSentMillis < DEBOUNCE_MILLIS))
-        {
-
-            continue; // debounce
-        }
+        // if (strcmp(switchID, lastSentSwitchID) == 0 &&
+        //     action == lastAction &&
+        //     (currentMillis - lastSentMillis < DEBOUNCE_MILLIS))
+        // {
+        //     delay(10);
+        //     continue; // debounce
+        // }
 
         publishRssi(rssi);
+
+        if (action == LEFT_PRESS || action == RIGHT_PRESS)
+        {
+            pendingPress = action;
+            pressPending = true;
+            holdStartMillis = currentMillis;
+            lastHoldMillis = currentMillis;
+            isHolding = true;
+            holdActionSent = false;
+            holdMessageCount = 0;
+        }
 
         if (action == RELEASE)
         {
@@ -62,16 +97,7 @@ void SwitchUnit::handlePacket(const byte *byteArr, float rssi)
             pendingPress = RELEASE;
         }
 
-        if (action == LEFT_PRESS || action == RIGHT_PRESS)
-        {
-            pendingPress = action;
-            pressPending = true;
-            holdStartMillis = currentMillis;
-            lastHoldMillis = currentMillis;
-            isHolding = true;
-            holdActionSent = false;
-            holdMessageCount = 0;
-        }
+        
 
         strcpy(lastSentSwitchID, switchID);
         lastAction = action;
