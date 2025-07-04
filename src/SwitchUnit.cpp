@@ -111,31 +111,32 @@ void SwitchUnit::checkHold()
     {
         if (pressPending)
         {
-
             if (pendingPress == LEFT_PRESS)
             {
+                Serial.println("Actions: [ LEFT_HOLDING_START ]");
                 publish(LEFT_HOLD, lastSentSwitchID);
             }
             else if (pendingPress == RIGHT_PRESS)
             {
+                Serial.println("Actions: [ RIGHT_HOLDING_START ]");
                 publish(RIGHT_HOLD, lastSentSwitchID);
             }
 
-            // publish(HOLD, lastSentSwitchID);
-            pressPending = false; // Don't send press anymore
+            pressPending = false; // Don't send the press anymore
         }
 
         if (holdMessageCount < maxHoldMessages)
         {
             if (millis() - lastHoldMillis >= 1000)
             {
-
                 if (pendingPress == LEFT_PRESS)
                 {
+                    Serial.printf("Actions: [ LEFT_HOLDING #%d ]\n", holdMessageCount + 1);
                     publish(LEFT_HOLD, lastSentSwitchID);
                 }
                 else if (pendingPress == RIGHT_PRESS)
                 {
+                    Serial.printf("Actions: [ RIGHT_HOLDING #%d ]\n", holdMessageCount + 1);
                     publish(RIGHT_HOLD, lastSentSwitchID);
                 }
 
@@ -146,6 +147,7 @@ void SwitchUnit::checkHold()
         }
         else
         {
+            Serial.println("Actions: [ HOLDING_END ]");
             isHolding = false;
         }
     }

@@ -10,6 +10,7 @@
 #include <unordered_map>
 #include <string>
 #include "SwitchUnit.h"
+#include <CircularBuffer.h>
 
 // CRC helper
 using namespace ace_crc::crc16ccitt_byte;
@@ -54,17 +55,21 @@ IotWebConfTextParameter mqttTopicParam = IotWebConfTextParameter("MQTT Topic", "
 
 bool needReset = false;
 
-// --- Packet Queue ---
-volatile uint8_t packetQueue[PACKET_QUEUE_SIZE][PACKET_LENGTH];
-volatile float packetRSSI[PACKET_QUEUE_SIZE];
-volatile uint8_t queueHead = 0;
-volatile uint8_t queueTail = 0;
+struct Packet {
+  uint8_t data[PACKET_LENGTH];
+  float rssi;
+};
 
-// --- FreeRTOS semaphore ---
-SemaphoreHandle_t packetSemaphore = NULL;
+CircularBuffer<Packet, PACKET_QUEUE_SIZE> packetQueue;
+
+TaskHandle_t radioTaskHandle = NULL;
 
 // --- Switch state ---
 std::unordered_map<std::string, SwitchUnit> switches;
+
+// For simple debounce
+Packet lastPacket;
+unsigned long lastPacketTime = 0;
 
 // --- Utils ---
 static void bytesToHexString(byte array[], unsigned int len, char buffer[]) {
@@ -85,7 +90,7 @@ static void publishMqtt(PubSubClient& mqttClient, const char *topicLevel0, const
   strcat(compiledTopic, "/");
   strcat(compiledTopic, topicLevel2);
 
-  Serial.printf("MQTT: %s => %s\n", compiledTopic, value);
+  // Serial.printf("MQTT: %s => %s\n", compiledTopic, value);
   mqttClient.publish(compiledTopic, value);
 
   digitalWrite(MQTT_SEND_PIN, HIGH);
@@ -95,36 +100,46 @@ static void publishMqtt(PubSubClient& mqttClient, const char *topicLevel0, const
 
 // --- ISR ---
 void IRAM_ATTR setFlag() {
-  if (packetSemaphore != NULL) {
-    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-    xSemaphoreGiveFromISR(packetSemaphore, &xHigherPriorityTaskWoken);
-    if (xHigherPriorityTaskWoken) {
-      portYIELD_FROM_ISR();
-    }
+  BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+  vTaskNotifyGiveFromISR(radioTaskHandle, &xHigherPriorityTaskWoken);
+  if (xHigherPriorityTaskWoken) {
+    portYIELD_FROM_ISR();
   }
 }
 
 // --- Fast radio task ---
 void radioTask(void *pvParameters) {
-  for (;;) {
-    if (xSemaphoreTake(packetSemaphore, portMAX_DELAY) == pdTRUE) {
-      byte byteArr[PACKET_LENGTH];
-      int state = radio.readData(byteArr, PACKET_LENGTH);
-      float rssi = radio.getRSSI();
+  Packet incoming;
 
-      if (state == RADIOLIB_ERR_NONE && rssi >= MIN_RSSI) {
-        uint8_t nextHead = (queueHead + 1) % PACKET_QUEUE_SIZE;
-        if (nextHead != queueTail) {
-          memcpy((void*)packetQueue[queueHead], byteArr, PACKET_LENGTH);
-          packetRSSI[queueHead] = rssi;
-          queueHead = nextHead;
-        } else {
-          Serial.println("Queue overflow");
+  for (;;) {
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
+    // Read radio data
+    int state = radio.readData(incoming.data, PACKET_LENGTH);
+    incoming.rssi = radio.getRSSI();
+
+    if (state == RADIOLIB_ERR_NONE && incoming.rssi >= MIN_RSSI) {
+      // Debounce check
+      unsigned long now = millis();
+      bool isDuplicate = true;
+      for (int i = 0; i < PACKET_LENGTH; i++) {
+        if (incoming.data[i] != lastPacket.data[i]) {
+          isDuplicate = false;
+          break;
         }
       }
 
-      radio.startReceive();
+      if (isDuplicate && (now - lastPacketTime) < 50) {
+        // Serial.println("Debounced duplicate packet");
+      } else {
+        lastPacket = incoming;
+        lastPacketTime = now;
+
+        packetQueue.push(incoming);
+      }
     }
+
+    radio.startReceive();
   }
 }
 
@@ -174,11 +189,7 @@ void setup() {
   pinMode(MQTT_SEND_PIN, OUTPUT);
   pinMode(ERROR_PIN, OUTPUT);
 
-  packetSemaphore = xSemaphoreCreateBinary();
-  if (packetSemaphore == NULL) {
-    Serial.println("Failed to create semaphore!");
-    while (1); // fatal!
-  }
+  xTaskCreatePinnedToCore(radioTask, "RadioTask", 4096, NULL, 2, &radioTaskHandle, 1);
 
   SPI.begin(18, 19, 23, 15);
 
@@ -198,8 +209,6 @@ void setup() {
 
   radio.setGdo0Action(setFlag, RISING);
   radio.startReceive();
-
-  xTaskCreatePinnedToCore(radioTask, "RadioTask", 4096, NULL, 2, NULL, 1);
 
   mqttGroup.addItem(&mqttServerParam);
   mqttGroup.addItem(&mqttTopicParam);
@@ -231,28 +240,26 @@ void loop() {
   }
   mqttClient.loop();
 
-  while (queueTail != queueHead) {
-    byte packet[PACKET_LENGTH];
-    memcpy(packet, (const void*)packetQueue[queueTail], PACKET_LENGTH);
-    float rssi = packetRSSI[queueTail];
-    queueTail = (queueTail + 1) % PACKET_QUEUE_SIZE;
+  // Process all packets in the buffer
+  while (!packetQueue.isEmpty()) {
+    Packet p = packetQueue.shift();
 
-    byte messageArr[] = {packet[0], packet[1], packet[2]};
-    unsigned long messageCRC = (packet[3] << 8) | packet[4];
+    byte messageArr[] = {p.data[0], p.data[1], p.data[2]};
+    unsigned long messageCRC = (p.data[3] << 8) | p.data[4];
     crc_t crc = crc_init();
     crc = crc_update(crc, messageArr, 3);
     crc = crc_finalize(crc);
 
     if (crc == messageCRC) {
       char switchID[5];
-      bytesToHexString(packet, 2, switchID);
+      bytesToHexString(p.data, 2, switchID);
       std::string idStr(switchID);
 
       if (switches.find(idStr) == switches.end()) {
         switches[idStr] = SwitchUnit();
         switches[idStr].setPublisher(myMqttPublish);
       }
-      switches[idStr].handlePacket(packet, rssi);
+      switches[idStr].handlePacket(p.data, p.rssi);
     } else {
       Serial.println("CRC mismatch");
     }
