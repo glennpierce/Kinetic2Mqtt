@@ -44,11 +44,11 @@ void SwitchUnit::handlePacket(const byte *byteArr, float rssi)
     byte actionByte = byteArr[2];
     std::vector<ButtonAction> actions;
 
-    for (int i = 7; i >= 0; i--)
-    {
-        Serial.print(bitRead(actionByte, i));
-    }
-    Serial.println();
+    // for (int i = 7; i >= 0; i--)
+    // {
+    //     Serial.print(bitRead(actionByte, i));
+    // }
+    // Serial.println();
 
     if ((actionByte & 0b00000001) != 0)
         actions.push_back(LEFT_PRESS);
@@ -63,13 +63,13 @@ void SwitchUnit::handlePacket(const byte *byteArr, float rssi)
 
     for (ButtonAction action : actions)
     {
-        // if (strcmp(switchID, lastSentSwitchID) == 0 &&
-        //     action == lastAction &&
-        //     (currentMillis - lastSentMillis < DEBOUNCE_MILLIS))
-        // {
-        //     delay(10);
-        //     continue; // debounce
-        // }
+        if (strcmp(switchID, lastSentSwitchID) == 0 &&
+            action == lastAction &&
+            (currentMillis - lastSentMillis < DEBOUNCE_MILLIS))
+        {
+            delay(10);
+            continue; // debounce
+        }
 
         publishRssi(rssi);
 
