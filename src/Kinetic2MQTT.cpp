@@ -17,7 +17,7 @@ using namespace ace_crc::crc16ccitt_byte;
 
 // --- Radio Config ---
 #define PACKET_LENGTH 5
-#define MIN_RSSI -80
+#define MIN_RSSI -120
 #define CARRIER_FREQUENCY 433.3
 #define BIT_RATE 100.0
 #define FREQUENCY_DEVIATION 50.0
@@ -118,6 +118,8 @@ void radioTask(void *pvParameters) {
     int state = radio.readData(incoming.data, PACKET_LENGTH);
     incoming.rssi = radio.getRSSI();
 
+    // Serial.println(incoming.rssi);
+    
     if (state == RADIOLIB_ERR_NONE && incoming.rssi >= MIN_RSSI) {
       // Debounce check
       unsigned long now = millis();
@@ -261,7 +263,7 @@ void loop() {
       }
       switches[idStr].handlePacket(p.data, p.rssi);
     } else {
-      Serial.println("CRC mismatch");
+      //Serial.println("CRC mismatch");
     }
   }
 
