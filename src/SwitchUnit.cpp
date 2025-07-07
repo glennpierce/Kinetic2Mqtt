@@ -1,13 +1,18 @@
 #include <PubSubClient.h>
 #include "SwitchUnit.h"
 
+// feature toggle
+#define ENABLE_HOLD 0  // set to 0 to disable hold/long-press handling
+
 const char* buttonActionToString(ButtonAction action) {
   switch (action) {
     case LEFT_PRESS: return "LEFT_PRESS";
     case RIGHT_PRESS: return "RIGHT_PRESS";
     case RELEASE: return "RELEASE";
+#if ENABLE_HOLD
     case LEFT_HOLD: return "LEFT_HOLD";
     case RIGHT_HOLD: return "RIGHT_HOLD";
+#endif
     default: return "UNKNOWN";
   }
 }
@@ -44,12 +49,6 @@ void SwitchUnit::handlePacket(const byte *byteArr, float rssi)
     byte actionByte = byteArr[2];
     std::vector<ButtonAction> actions;
 
-    // for (int i = 7; i >= 0; i--)
-    // {
-    //     Serial.print(bitRead(actionByte, i));
-    // }
-    // Serial.println();
-
     if ((actionByte & 0b00000001) != 0)
         actions.push_back(LEFT_PRESS);
     if ((actionByte & 0b00001000) != 0)
@@ -73,8 +72,13 @@ void SwitchUnit::handlePacket(const byte *byteArr, float rssi)
 
         publishRssi(rssi);
 
+#if ENABLE_HOLD
         if (action == LEFT_PRESS || action == RIGHT_PRESS)
         {
+            // forcibly clear any previous hold:
+            isHolding = false;
+            pressPending = false;
+
             pendingPress = action;
             pressPending = true;
             holdStartMillis = currentMillis;
@@ -96,8 +100,10 @@ void SwitchUnit::handlePacket(const byte *byteArr, float rssi)
             isHolding = false;
             pendingPress = RELEASE;
         }
-
-        
+#else
+        // HOLD disabled, just send press/release directly
+        publish(action, switchID);
+#endif
 
         strcpy(lastSentSwitchID, switchID);
         lastAction = action;
@@ -107,6 +113,7 @@ void SwitchUnit::handlePacket(const byte *byteArr, float rssi)
 
 void SwitchUnit::checkHold()
 {
+#if ENABLE_HOLD
     if (isHolding && (millis() - holdStartMillis > HOLD_THRESHOLD_TIME))
     {
         if (pressPending)
@@ -151,6 +158,7 @@ void SwitchUnit::checkHold()
             isHolding = false;
         }
     }
+#endif
 }
 
 void SwitchUnit::publish(ButtonAction action, const char *switchID)
@@ -167,12 +175,14 @@ void SwitchUnit::publish(ButtonAction action, const char *switchID)
     case RELEASE:
         actionStr = "release";
         break;
+#if ENABLE_HOLD
     case LEFT_HOLD:
         actionStr = "left_hold";
         break;
     case RIGHT_HOLD:
         actionStr = "right_hold";
         break;
+#endif
     }
     publishMqtt("action", switchID, actionStr);
 }

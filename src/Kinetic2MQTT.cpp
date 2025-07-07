@@ -15,16 +15,18 @@
 // CRC helper
 using namespace ace_crc::crc16ccitt_byte;
 
+// --- Feature toggles ---
+#define ENABLE_MQTT 1 // <-- set to 0 to disable MQTT send
+
 // --- Radio Config ---
 #define PACKET_LENGTH 5
-#define MIN_RSSI -120
+#define MIN_RSSI -105
 #define CARRIER_FREQUENCY 433.3
 #define BIT_RATE 100.0
 #define FREQUENCY_DEVIATION 50.0
 #define RX_BANDWIDTH 135.0
 #define OUTPUT_POWER 10
 #define PREAMBLE_LENGTH 16
-
 #define PACKET_QUEUE_SIZE 8
 
 // CC1101 module
@@ -83,6 +85,7 @@ static void bytesToHexString(byte array[], unsigned int len, char buffer[]) {
 }
 
 static void publishMqtt(PubSubClient& mqttClient, const char *topicLevel0, const char *topicLevel1, const char *topicLevel2, const char *value) {
+#if ENABLE_MQTT
   char compiledTopic[strlen(topicLevel0) + strlen(topicLevel1) + strlen(topicLevel2) + 3] = "";
   strcat(compiledTopic, topicLevel0);
   strcat(compiledTopic, "/");
@@ -90,12 +93,15 @@ static void publishMqtt(PubSubClient& mqttClient, const char *topicLevel0, const
   strcat(compiledTopic, "/");
   strcat(compiledTopic, topicLevel2);
 
-  // Serial.printf("MQTT: %s => %s\n", compiledTopic, value);
   mqttClient.publish(compiledTopic, value);
 
   digitalWrite(MQTT_SEND_PIN, HIGH);
   delay(50);
   digitalWrite(MQTT_SEND_PIN, LOW);
+#else
+  Serial.printf("[INFO] MQTT disabled: %s/%s/%s -> %s\n",
+    topicLevel0, topicLevel1, topicLevel2, value);
+#endif
 }
 
 // --- ISR ---
@@ -114,33 +120,35 @@ void radioTask(void *pvParameters) {
   for (;;) {
     ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 
-    // Read radio data
     int state = radio.readData(incoming.data, PACKET_LENGTH);
     incoming.rssi = radio.getRSSI();
 
-    // Serial.println(incoming.rssi);
-    
-    if (state == RADIOLIB_ERR_NONE && incoming.rssi >= MIN_RSSI) {
-      // Debounce check
-      unsigned long now = millis();
-      bool isDuplicate = true;
-      for (int i = 0; i < PACKET_LENGTH; i++) {
-        if (incoming.data[i] != lastPacket.data[i]) {
-          isDuplicate = false;
-          break;
+    if (state == RADIOLIB_ERR_NONE) {
+      if (incoming.rssi >= MIN_RSSI) {
+        unsigned long now = millis();
+        bool isDuplicate = true;
+        for (int i = 0; i < PACKET_LENGTH; i++) {
+          if (incoming.data[i] != lastPacket.data[i]) {
+            isDuplicate = false;
+            break;
+          }
         }
-      }
 
-      if (isDuplicate && (now - lastPacketTime) < 50) {
-        // Serial.println("Debounced duplicate packet");
+        if (isDuplicate && (now - lastPacketTime) < 50) {
+          // debounced duplicate
+        } else {
+          lastPacket = incoming;
+          lastPacketTime = now;
+          packetQueue.push(incoming);
+        }
       } else {
-        lastPacket = incoming;
-        lastPacketTime = now;
-
-        packetQueue.push(incoming);
+        // log dropped weak packet
+        // char hexBuffer[PACKET_LENGTH * 2 + 1];
+        // bytesToHexString(incoming.data, PACKET_LENGTH, hexBuffer);
+        // Serial.printf("[%lu ms] [INFO] Packet dropped due to low RSSI: %s, RSSI: %.1f\n",
+        //               millis(), hexBuffer, incoming.rssi);
       }
     }
-
     radio.startReceive();
   }
 }
@@ -172,6 +180,7 @@ bool formValidator(iotwebconf::WebRequestWrapper *webRequestWrapper) {
 }
 
 void connectMqtt() {
+#if ENABLE_MQTT
   Serial.print("Connecting MQTT...");
   String clientId = iotWebConf.getThingName() + String(random(0xffff), HEX);
   if (mqttClient.connect(clientId.c_str())) {
@@ -181,6 +190,9 @@ void connectMqtt() {
     Serial.printf("MQTT failed (%d), retrying in 5s\n", mqttClient.state());
     delay(5000);
   }
+#else
+  Serial.println("MQTT connect disabled (ENABLE_MQTT=0)");
+#endif
 }
 
 // --- Setup ---
@@ -205,7 +217,7 @@ void setup() {
 
   radio.setCrcFiltering(false);
   radio.fixedPacketLengthMode(PACKET_LENGTH);
-  radio.setPreambleLength(16, 1);  // 16 bits preamble
+  radio.setPreambleLength(16, 1);
   uint8_t syncWord[] = {0xA4, 0x23};
   radio.setSyncWord(syncWord, 2);
 
@@ -225,7 +237,9 @@ void setup() {
   server.on("/", []() { iotWebConf.handleConfig(); });
   server.onNotFound([]() { iotWebConf.handleNotFound(); });
 
+#if ENABLE_MQTT
   mqttClient.setServer(mqttServerValue, 1883);
+#endif
 }
 
 // --- Loop ---
@@ -237,12 +251,13 @@ void loop() {
     ESP.restart();
   }
 
+#if ENABLE_MQTT
   if (iotWebConf.getState() == iotwebconf::OnLine && !mqttClient.connected()) {
     connectMqtt();
   }
   mqttClient.loop();
+#endif
 
-  // Process all packets in the buffer
   while (!packetQueue.isEmpty()) {
     Packet p = packetQueue.shift();
 
@@ -263,7 +278,10 @@ void loop() {
       }
       switches[idStr].handlePacket(p.data, p.rssi);
     } else {
-      //Serial.println("CRC mismatch");
+      char hexBuffer[PACKET_LENGTH * 2 + 1];
+      bytesToHexString(p.data, PACKET_LENGTH, hexBuffer);
+      Serial.printf("[%lu ms] [WARN] CRC mismatch on packet: %s, RSSI: %.1f\n",
+                    millis(), hexBuffer, p.rssi);
     }
   }
 
