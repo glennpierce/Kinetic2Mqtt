@@ -10,21 +10,24 @@
 #include <unordered_map>
 #include <string>
 #include "SwitchUnit.h"
-#include <CircularBuffer.h>
+#include <CircularBuffer.hpp>
 
 // CRC helper
 using namespace ace_crc::crc16ccitt_byte;
 
 // --- Feature toggles ---
 #define ENABLE_MQTT 1 // <-- set to 0 to disable MQTT send
+#define ENABLE_DEBOUNCE 0       // <-- set to 0 to disable per-switch debounce
 
 // --- Radio Config ---
 #define PACKET_LENGTH 5
-#define MIN_RSSI -105
+#define MIN_RSSI -110
 #define CARRIER_FREQUENCY 433.3
 #define BIT_RATE 100.0
-#define FREQUENCY_DEVIATION 50.0
-#define RX_BANDWIDTH 135.0
+#define FREQUENCY_DEVIATION 25.0
+// #define RX_BANDWIDTH 135.0
+//#define RX_BANDWIDTH 325.0
+#define RX_BANDWIDTH 250.0
 #define OUTPUT_POWER 10
 #define PREAMBLE_LENGTH 16
 #define PACKET_QUEUE_SIZE 8
@@ -95,9 +98,9 @@ static void publishMqtt(PubSubClient& mqttClient, const char *topicLevel0, const
 
   mqttClient.publish(compiledTopic, value);
 
-  digitalWrite(MQTT_SEND_PIN, HIGH);
-  delay(50);
-  digitalWrite(MQTT_SEND_PIN, LOW);
+  // digitalWrite(MQTT_SEND_PIN, HIGH);
+  // delay(50);
+  // digitalWrite(MQTT_SEND_PIN, LOW);
 #else
   Serial.printf("[INFO] MQTT disabled: %s/%s/%s -> %s\n",
     topicLevel0, topicLevel1, topicLevel2, value);
@@ -113,9 +116,13 @@ void IRAM_ATTR setFlag() {
   }
 }
 
-// --- Fast radio task ---
+// --- Fast radio task with per-switch debounce ---
 void radioTask(void *pvParameters) {
   Packet incoming;
+
+#if ENABLE_DEBOUNCE
+  std::unordered_map<std::string, unsigned long> lastSeenTime;
+#endif
 
   for (;;) {
     ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
@@ -125,30 +132,38 @@ void radioTask(void *pvParameters) {
 
     if (state == RADIOLIB_ERR_NONE) {
       if (incoming.rssi >= MIN_RSSI) {
+        char switchID[5];
+        bytesToHexString(incoming.data, 2, switchID);
+        std::string idStr(switchID);
+
+#if ENABLE_DEBOUNCE
         unsigned long now = millis();
-        bool isDuplicate = true;
-        for (int i = 0; i < PACKET_LENGTH; i++) {
-          if (incoming.data[i] != lastPacket.data[i]) {
-            isDuplicate = false;
-            break;
-          }
+        bool allowPacket = true;
+
+        auto it = lastSeenTime.find(idStr);
+        if (it != lastSeenTime.end() && (now - it->second) < 150) {
+          allowPacket = false;
         }
 
-        if (isDuplicate && (now - lastPacketTime) < 50) {
-          // debounced duplicate
-        } else {
-          lastPacket = incoming;
-          lastPacketTime = now;
+        if (allowPacket) {
+          lastSeenTime[idStr] = now;
           packetQueue.push(incoming);
+        } else {
+          // Optional: debug log
+          // Serial.printf("[%lu ms] [DEBUG] Debounced packet from %s\n", now, idStr.c_str());
         }
+#else
+        packetQueue.push(incoming);
+#endif
+
       } else {
-        // log dropped weak packet
+        // Optional: log weak RSSI
         // char hexBuffer[PACKET_LENGTH * 2 + 1];
         // bytesToHexString(incoming.data, PACKET_LENGTH, hexBuffer);
-        // Serial.printf("[%lu ms] [INFO] Packet dropped due to low RSSI: %s, RSSI: %.1f\n",
-        //               millis(), hexBuffer, incoming.rssi);
+        // Serial.printf("[%lu ms] [INFO] Dropped weak packet: %s, RSSI: %.1f\n", millis(), hexBuffer, incoming.rssi);
       }
     }
+
     radio.startReceive();
   }
 }
@@ -203,6 +218,8 @@ void setup() {
   pinMode(MQTT_SEND_PIN, OUTPUT);
   pinMode(ERROR_PIN, OUTPUT);
 
+  digitalWrite(MQTT_SEND_PIN, LOW);
+
   xTaskCreatePinnedToCore(radioTask, "RadioTask", 4096, NULL, 2, &radioTaskHandle, 1);
 
   SPI.begin(18, 19, 23, 15);
@@ -254,6 +271,7 @@ void loop() {
 #if ENABLE_MQTT
   if (iotWebConf.getState() == iotwebconf::OnLine && !mqttClient.connected()) {
     connectMqtt();
+    digitalWrite(MQTT_SEND_PIN, HIGH);
   }
   mqttClient.loop();
 #endif
